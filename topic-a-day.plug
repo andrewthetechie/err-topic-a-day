@@ -1,0 +1,12 @@
+[Core]
+Name = TopicADay
+Module = topic-a-day
+
+[Documentation]
+Description = This is a plugin that manages a TopicADay Channel!
+
+[Python]
+Version = 3
+
+[Errbot]
+min = 5.2.0
