@@ -1,19 +1,19 @@
-from datetime import datetime
-from hashlib import md5
 import random
-from typing import Any
-from typing import List
-from typing import Dict
+from datetime import datetime
+from hashlib import sha256
+from io import StringIO
 from threading import RLock
+from typing import Any
+from typing import Dict
+from typing import List
 
-from errbot.backends.base import Message as ErrbotMessage
-from errbot import BotPlugin
-from errbot import Command
-from errbot import ValidationException
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from decouple import config as get_config
 from errbot import arg_botcmd
 from errbot import botcmd
-from decouple import config as get_config
-import schedule
+from errbot import BotPlugin
+from errbot.backends.base import Message as ErrbotMessage
 from wrapt import synchronized  # https://stackoverflow.com/a/29403915
 
 TOPICS_LOCK = RLock()
@@ -32,7 +32,7 @@ def get_config_item(
         config[key] = get_config(key, **decouple_kwargs)
 
 
-class Topics(object):
+class Topics:
     """
     Topics are our topics that we want to post. This is basically a big wrapper class around a python list of
     dicts that uses the Errbot Storage engine to store itself.
@@ -44,7 +44,7 @@ class Topics(object):
     def __init__(self, bot_plugin: BotPlugin) -> None:
         self.bot_plugin = bot_plugin
         try:
-            _ = self.bot_plugin["TOPICS"]
+            self.bot_plugin["TOPICS"]
         except KeyError:
             # this is the first time this plugin is starting up
             self.bot_plugin["TOPICS"] = []
@@ -65,15 +65,18 @@ class Topics(object):
             }
         )
         self.bot_plugin["TOPICS"] = topics
-        return
 
     def get_random(self) -> Dict:
         """
         Returns a random, unused topic
         """
-        return random.choice(
-            list(filter(lambda d: not d["used"], self.bot_plugin["TOPICS"]))
-        )
+        try:
+            return random.choice(  # nosec
+                list(filter(lambda d: not d["used"], self.bot_plugin["TOPICS"]))
+            )
+        except IndexError:
+            self.bot_plugin.log.error("Topic list was empty when trying to get a topic")
+            raise self.NoNewTopicsError("No new topics")
 
     def list(self) -> List[Dict]:
         """
@@ -98,8 +101,7 @@ class Topics(object):
                 self.bot_plugin["TOPICS"] = topics
                 found = True
         if not found:
-            raise KeyError("%s not found in topic list", topic_id)
-        return
+            raise KeyError(f"{topic_id} not found in topic list")
 
     @synchronized(TOPICS_LOCK)
     def delete(self, topic_id: str) -> None:
@@ -113,19 +115,19 @@ class Topics(object):
         for index, topic in enumerate(topics):
             if topic["id"] == topic_id:
                 found = True
+                to_pop = index
                 break
         if not found:
-            raise KeyError("%s not found in topic list", topic_id)
-        topics.pop(index)
+            raise KeyError(f"{topic_id} not found in topic list")
+        topics.pop(to_pop)
         self.bot_plugin["TOPICS"] = topics
-        return
 
     @staticmethod
     def hash_topic(topic: str) -> str:
         """
         Returns an 8 character id hash of a topic with the current datetime (for uniqueness)
         """
-        return md5(f"{topic}-{datetime.now()}".encode("utf-8")).hexdigest()[:8]
+        return sha256(f"{topic}-{datetime.now()}".encode("utf-8")).hexdigest()[:8]
 
     class NoNewTopicsError(Exception):
         pass
@@ -149,21 +151,13 @@ class TopicADay(BotPlugin):
         super().activate()
         self.topics = Topics(self)
         # schedule our daily jobs
-        for day in self.config["TOPIC_DAYS"]:
-            getattr(schedule.every(), day).at(self.config["TOPIC_TIME"]).do(
-                self.post_topic
-            )
-
-        self.start_poller(
-            self.config["TOPIC_POLLER_INTERVAL"], self.run_scheduled_jobs, None
+        self.sched = BackgroundScheduler(
+            {"apscheduler.timezome": self.config["TOPIC_TZ"]}
         )
-
-    def deactivate(self) -> None:
-        """
-        Deactivates the plugin by stopping our scheduled jobs poller
-        """
-        # self.stop_poller(self.config['TOPIC_POLLER_INTERVAL'], self.run_scheduled_jobs)
-        super().deactivate()
+        self.sched.add_job(
+            self.post_topic, CronTrigger.from_crontab(self.config["TOPIC_SCHEDULE"])
+        )
+        self.sched.start()
 
     def configure(self, configuration: Dict) -> None:
         """
@@ -175,44 +169,13 @@ class TopicADay(BotPlugin):
 
         # name of the channel to post in
         get_config_item("TOPIC_CHANNEL", configuration)
-        configuration["TOPIC_CHANNEL_ID"] = self._bot.channelname_to_channelid(
-            configuration["TOPIC_CHANNEL"]
-        )
-        # Days to post a topic. Comma separated list of day names
-        get_config_item(
-            "TOPIC_DAYS",
-            configuration,
-            cast=lambda v: [s.lower() for s in v.split(",")],
-            default="monday,tuesday,wednesday,thursday,friday",
-        )
-        # what time the topic is posted every day, 24hr notation
-        get_config_item("TOPIC_TIME", configuration, default="09:00")
-        # How frequently the poller runs. Lower numbers might result in higher load
-        get_config_item("TOPIC_POLLER_INTERVAL", configuration, default=5, cast=int)
-        super().configure(configuration)
-
-    def check_configuration(self, configuration: Dict) -> None:
-        """
-        Validates our config
-        Raises:
-            errbot.ValidationException when the configuration is invalid
-        """
-        if configuration["TOPIC_CHANNEL"][0] != "#":
-            raise ValidationException(
-                "TOPIC_CHANNEL should be in the format #channel-name"
+        if getattr(self._bot, "channelname_to_channelid", None) is not None:
+            configuration["TOPIC_CHANNEL_ID"] = self._bot.channelname_to_channelid(
+                configuration["TOPIC_CHANNEL"]
             )
-
-        VALID_DAY_NAMES = set(
-            "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"
-        )
-        invalid_days = [
-            day for day in configuration["TOPIC_DAYS"] if day not in VALID_DAY_NAMES
-        ]
-        if len(invalid_days) > 0:
-            raise ValidationException("TOPIC_DAYS invalid %s", invalid_days)
-
-        # TODO: Write more configuration validation
-        return
+        get_config_item("TOPIC_SCHEDULE", configuration, default="0 9 * * 1,3,5")
+        get_config_item("TOPIC_TZ", configuration, default="UTC")
+        super().configure(configuration)
 
     @botcmd
     @arg_botcmd("topic", nargs="*", type=str, help="Topic to add to our topic list")
@@ -228,8 +191,30 @@ class TopicADay(BotPlugin):
             msg.frm, f"Topic added to the list: ```{topic_sentence}```", in_reply_to=msg
         )
 
+    @botcmd(admin_only=True)
+    @arg_botcmd(
+        "topic_id", type=str, help="Hash of the topic to remove from list topics"
+    )
+    def delete_topic(self, msg: ErrbotMessage, topic_id: str) -> str:
+        """
+        Deletes a topic from the topic list
+
+        """
+        if len(topic_id) != 8:
+            self.send(msg.frm, f"Invalid Topic ID", in_reply_to=msg)
+            return
+
+        try:
+            self.topics.delete(topic_id)
+        except KeyError:
+            self.send(msg.frm, f"Invalid Topic ID", in_reply_to=msg)
+            return
+
+        self.send(msg.frm, f"Topic Deleted", in_reply_to=msg)
+        return
+
     @botcmd
-    def list_topics(self, msg: ErrbotMessage, args: List) -> None:
+    def list_topics(self, msg: ErrbotMessage, _: List) -> None:
         """
         Lists all of our topics
         """
@@ -255,18 +240,55 @@ class TopicADay(BotPlugin):
             in_reply_to=msg,
         )
 
+    @botcmd(admin_only=True)
+    def list_topic_jobs(self, msg: ErrbotMessage, _: List) -> None:
+        """
+        List the scheduled jobs
+        """
+        pjobs_out = StringIO()
+        self.sched.print_jobs(out=pjobs_out)
+        self.send(msg.frm, pjobs_out.getvalue(), in_reply_to=msg)
+
     def post_topic(self) -> None:
-        new_topic = self.topics.get_random()
+        """
+        Called by our scheduled jobs to post the topic message for the day. Also calls any backend specific
+        pre_post_topic methods
+        """
+        self.log.debug("Calling post_topic")
+        try:
+            new_topic = self.topics.get_random()
+        except Topics.NoNewTopicsError:
+            self.log.error("No new topics, cannot post")
+            self.warn_admins(
+                "There are no new topics for topic a day so today's post failed"
+            )
+            return
         topic_template = f"Today's Topic: {new_topic['topic']}"
-        self._bot.api_call(
-            "channels.setTopic",
-            {"channel": self.config["TOPIC_CHANNEL_ID"], "topic": topic_template},
-        )
+        self.log.debug("Topic template: %s", topic_template)
+        # call any special steps for the backend
+        try:
+            backend_specific = getattr(self, f"{self._bot.mode}_pre_post_topic")
+            backend_specific(topic_template)
+        except AttributeError:
+            self.log.debug("%s has no backend specific tasks", self._bot.mode)
+        self.log.debug("Sending message to channel")
         self.send(self.build_identifier(self.config["TOPIC_CHANNEL"]), topic_template)
+        self.log.debug("Setting topic to used")
         self.topics.set_used(new_topic["id"])
 
-    def run_scheduled_jobs(self) -> None:
+    # Backend specific pre_post tasks. Examples include setting channel topics
+    # Backend specific pre_post tasks should be named like {backend_name}_pre_post_topic and take two arguments, self
+    # and a topic: str. They should not return anything
+    def slack_pre_post_topic(self, topic: str) -> None:
         """
-        Run by an errbot poller to run schedule jobs
+        Called from post_topic before the topic is posted. For slack, this also sets the channel topic
         """
-        schedule.run_pending()
+        self._bot.api_call(
+            "channels.setTopic",
+            {
+                "channel": self._bot.channelname_to_channelid(
+                    self.config["TOPIC_CHANNEL"]
+                ),
+                "topic": topic,
+            },
+        )
