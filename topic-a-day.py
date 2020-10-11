@@ -1,4 +1,6 @@
+import logging
 import random
+import secrets
 from datetime import datetime
 from hashlib import sha256
 from io import StringIO
@@ -7,16 +9,32 @@ from typing import Any
 from typing import Dict
 from typing import List
 
+import requests
+from apscheduler.jobstores.base import ConflictingIdError
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from decouple import config as get_config
 from errbot import arg_botcmd
 from errbot import botcmd
 from errbot import BotPlugin
+from errbot import webhook
 from errbot.backends.base import Message as ErrbotMessage
+from flask import abort
 from wrapt import synchronized  # https://stackoverflow.com/a/29403915
 
 TOPICS_LOCK = RLock()
+
+
+def do_webhook_post(url, headers={}, data={}):
+    logger = logging.getLogger()
+    logger.debug("Starting request for %s with headers: %s", url, headers)
+    try:
+        response = requests.post(url, headers=headers, data=data)
+    except Exception as err:
+        logger.error("Error while doing request: %s", err)
+        return
+    logger.debug("Webhook status code: %s", response.status_code)
+    logger.debug("Webhook response: %s", response.text)
 
 
 def get_config_item(
@@ -61,7 +79,7 @@ class Topics:
                 "id": self.hash_topic(topic),
                 "topic": topic,
                 "used": False,
-                "date_used": None,
+                "used_date": None,
             }
         )
         self.bot_plugin["TOPICS"] = topics
@@ -98,10 +116,10 @@ class Topics:
             if topic["id"] == topic_id:
                 topic["used"] = True
                 topic["used_date"] = datetime.now()
-                self.bot_plugin["TOPICS"] = topics
                 found = True
         if not found:
             raise KeyError(f"{topic_id} not found in topic list")
+        self.bot_plugin["TOPICS"] = topics
 
     @synchronized(TOPICS_LOCK)
     def delete(self, topic_id: str) -> None:
@@ -120,6 +138,25 @@ class Topics:
         if not found:
             raise KeyError(f"{topic_id} not found in topic list")
         topics.pop(to_pop)
+        self.bot_plugin["TOPICS"] = topics
+
+    @synchronized(TOPICS_LOCK)
+    def reset(self, topic_id: str) -> None:
+        """
+        resets the topic at topic_id
+
+        topic_id should be the 8 character topic hash from id in the topic
+        """
+        found = False
+        topics = self.bot_plugin["TOPICS"]
+        for index, topic in enumerate(topics):
+            if topic["id"] == topic_id:
+                found = True
+                topic["used"] = False
+                topic["used_date"] = None
+                break
+        if not found:
+            raise KeyError(f"{topic_id} not found in topic list")
         self.bot_plugin["TOPICS"] = topics
 
     @staticmethod
@@ -151,13 +188,42 @@ class TopicADay(BotPlugin):
         super().activate()
         self.topics = Topics(self)
         # schedule our daily jobs
-        self.sched = BackgroundScheduler(
-            {"apscheduler.timezome": self.config["TOPIC_TZ"]}
-        )
-        self.sched.add_job(
-            self.post_topic, CronTrigger.from_crontab(self.config["TOPIC_SCHEDULE"])
-        )
+        self.sched = BackgroundScheduler(self.config["TAD_APSCHEDULER_CONFIG"])
+        try:
+            if self.config["TAD_ENABLE_WEBHOOK"]:
+                request_args = {"url": self.config["TAD_WEBHOOK_URL"]}
+                if self.config["AUTH_POST_WEBHOOK"]:
+                    request_args["headers"] = {
+                        "x-auth-token": self.config["AUTH_POST_WEBHOOK_TOKEN"]
+                    }
+                self.sched.add_job(
+                    do_webhook_post,
+                    CronTrigger.from_crontab(self.config["TAD_SCHEDULE"]),
+                    kwargs=request_args,
+                    name="topic-a-day",
+                    id="topic-a-day",
+                    replace_existing=True,
+                )
+            else:
+                self.sched.add_job(
+                    self.post_topic,
+                    CronTrigger.from_crontab(self.config["TAD_SCHEDULE"]),
+                    name="topic-a-day",
+                    id="topic-a-day",
+                    replace_existing=True,
+                )
+        except ConflictingIdError as err:
+            self.log.debug("Hit error when adding job: %s", err)
+        except Exception as err:
+            self.log.error("Hit error while adding job: %s", err)
         self.sched.start()
+
+    def deactivate(self) -> None:
+        """
+        Shutsdown the scheduler and calls super deactivate
+        """
+        self.sched.shutdown()
+        super().deactivate()
 
     def configure(self, configuration: Dict) -> None:
         """
@@ -168,14 +234,52 @@ class TopicADay(BotPlugin):
             configuration = dict()
 
         # name of the channel to post in
-        get_config_item("TOPIC_CHANNEL", configuration)
+        get_config_item("TAD_CHANNEL", configuration)
         if getattr(self._bot, "channelname_to_channelid", None) is not None:
             configuration["TOPIC_CHANNEL_ID"] = self._bot.channelname_to_channelid(
-                configuration["TOPIC_CHANNEL"]
+                configuration["TAD_CHANNEL"]
             )
-        get_config_item("TOPIC_SCHEDULE", configuration, default="0 9 * * 1,3,5")
-        get_config_item("TOPIC_TZ", configuration, default="UTC")
+        get_config_item("TAD_SCHEDULE", configuration, default="0 9 * * 1,3,5")
+
+        # apscheduler config
+        get_config_item("TAD_APSCHEDULER_CONFIG_FILE", configuration, default="")
+        if configuration["TAD_APSCHEDULER_CONFIG_FILE"] != "":
+            configuration["TAD_APSCHEDULER_CONFIG"] = self._load_config_file(
+                configuration["TAD_APSCHEDULER_CONFIG_FILE"]
+            )
+        else:
+            get_config_item("TOPIC_TZ", configuration, default="UTC")
+            configuration["TAD_APSCHEDULER_CONFIG"] = {
+                "apscheduler.timezone": configuration["TOPIC_TZ"]
+            }
+
+        # Webhook options
+        get_config_item("TAD_ENABLE_WEBHOOK", configuration, default="False", cast=bool)
+        if configuration["TAD_ENABLE_WEBHOOK"]:
+            get_config_item(
+                "TAD_WEBHOOK_URL",
+                configuration,
+                default="http://localhost:3142/post_topic_rpc",
+            )
+            get_config_item(
+                "AUTH_POST_WEBHOOK", configuration, default="True", cast=bool
+            )
+            if configuration["AUTH_POST_WEBHOOK"]:
+                get_config_item(
+                    "AUTH_POST_WEBHOOK_TOKEN",
+                    configuration,
+                    default=secrets.token_urlsafe(),
+                )
         super().configure(configuration)
+
+    @staticmethod
+    def _load_config_file(filepath: str) -> Dict:
+        """"""
+        import json
+
+        with open(filepath, "r") as config_file:
+            data = json.load(config_file)
+        return data
 
     @botcmd
     @arg_botcmd("topic", nargs="*", type=str, help="Topic to add to our topic list")
@@ -195,23 +299,38 @@ class TopicADay(BotPlugin):
     @arg_botcmd(
         "topic_id", type=str, help="Hash of the topic to remove from list topics"
     )
+    def reset_topic(self, msg: ErrbotMessage, topic_id: str) -> str:
+        """
+        Resets a topic from the topic list so it can be posted again
+        """
+        if len(topic_id) != 8:
+            return "Invalid Topic ID"
+
+        try:
+            self.topics.reset(topic_id)
+        except KeyError:
+            return "Invalid Topic ID"
+
+        return "Topic Reset"
+
+    @botcmd(admin_only=True)
+    @arg_botcmd(
+        "topic_id", type=str, help="Hash of the topic to remove from list topics"
+    )
     def delete_topic(self, msg: ErrbotMessage, topic_id: str) -> str:
         """
         Deletes a topic from the topic list
 
         """
         if len(topic_id) != 8:
-            self.send(msg.frm, f"Invalid Topic ID", in_reply_to=msg)
-            return
+            return "Invalid Topic ID"
 
         try:
             self.topics.delete(topic_id)
         except KeyError:
-            self.send(msg.frm, f"Invalid Topic ID", in_reply_to=msg)
-            return
+            return "Invalid Topic ID"
 
-        self.send(msg.frm, f"Topic Deleted", in_reply_to=msg)
-        return
+        return "Topic Deleted"
 
     @botcmd
     def list_topics(self, msg: ErrbotMessage, _: List) -> None:
@@ -224,7 +343,7 @@ class TopicADay(BotPlugin):
         for topic in topics:
             if topic["used"]:
                 used_topics.append(
-                    f"{topic['id']}: {topic['topic']} -- Posted on {topic['date_used']}"
+                    f"{topic['id']}: {topic['topic']} -- Posted on {topic['used_date'].strftime('%Y-%m-%d %H:%M')}"
                 )
             else:
                 free_topics.append(f"{topic['id']}: {topic['topic']}")
@@ -249,6 +368,20 @@ class TopicADay(BotPlugin):
         self.sched.print_jobs(out=pjobs_out)
         self.send(msg.frm, pjobs_out.getvalue(), in_reply_to=msg)
 
+    @webhook(methods=["POST"], raw=True)
+    def post_topic_rpc(self, request):
+        if not self.config["TAD_ENABLE_WEBHOOK"]:
+            abort(500)
+        if self.config["AUTH_POST_WEBHOOK"]:
+            if (
+                request.headers.get("x-auth-token", "")
+                != self.config["AUTH_POST_WEBHOOK_TOKEN"]
+            ):
+                abort(403, "Endpoint auth turned on and your auth token did not match")
+
+        self.post_topic()
+        return "Ok"
+
     def post_topic(self) -> None:
         """
         Called by our scheduled jobs to post the topic message for the day. Also calls any backend specific
@@ -272,7 +405,7 @@ class TopicADay(BotPlugin):
         except AttributeError:
             self.log.debug("%s has no backend specific tasks", self._bot.mode)
         self.log.debug("Sending message to channel")
-        self.send(self.build_identifier(self.config["TOPIC_CHANNEL"]), topic_template)
+        self.send(self.build_identifier(self.config["TAD_CHANNEL"]), topic_template)
         self.log.debug("Setting topic to used")
         self.topics.set_used(new_topic["id"])
 
@@ -286,9 +419,7 @@ class TopicADay(BotPlugin):
         self._bot.api_call(
             "channels.setTopic",
             {
-                "channel": self._bot.channelname_to_channelid(
-                    self.config["TOPIC_CHANNEL"]
-                ),
+                "channel": self.config["TOPIC_CHANNEL_ID"],
                 "topic": topic,
             },
         )
